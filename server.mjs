@@ -22,7 +22,9 @@ async function body(req){
   if(!nickname||Array.from(nickname).length>24||/[\u0000-\u001f\u007f]/.test(nickname))throw new HttpError(400,'请填写1—24个字的昵称。');
   if(!choices.has(data.restaurantId))throw new HttpError(400,'请选择列表中的餐厅。');
   if(typeof data.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))throw new HttpError(400,'提交标识不正确，请刷新重试。');
-  return {...data,nickname};
+  const action=data.action??'add';
+  if(!['add','remove'].includes(action))throw new HttpError(400,'投票操作不正确。');
+  return {...data,nickname,action};
 }
 export async function createApp(pool,{publicOrigin,staticDir=path.join(root,'dist')}={}){
   await pool.query(await readFile(path.join(root,'schema.sql'),'utf8'));
@@ -47,25 +49,30 @@ export async function createApp(pool,{publicOrigin,staticDir=path.join(root,'dis
             const rawBefore=Number(url.searchParams.get('before'));
             const before=Number.isSafeInteger(rawBefore)&&rawBefore>0?rawBefore:Number.MAX_SAFE_INTEGER;
             await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-            const counts=(await db.query('SELECT restaurant_id, COUNT(*)::int AS count FROM votes GROUP BY restaurant_id')).rows;
-            const mine=(await db.query('SELECT nickname,restaurant_id,updated_at FROM votes WHERE voter_hash=$1',[user.hash])).rows[0]||null;
+            const counts=(await db.query('SELECT restaurant_id, COUNT(*)::int AS count FROM vote_choices GROUP BY restaurant_id')).rows;
+            const participants=(await db.query('SELECT COUNT(DISTINCT voter_hash)::int AS count FROM vote_choices')).rows[0].count;
+            const mySelections=(await db.query('SELECT nickname,restaurant_id,updated_at FROM vote_choices WHERE voter_hash=$1 ORDER BY updated_at DESC,restaurant_id',[user.hash])).rows.map(v=>({...v,updated_at:Number(v.updated_at)}));
+            // Keep mine for clients that opened the old page before this update.
+            const mine=mySelections[0]||null;
             const rows=(await db.query('SELECT id,nickname,restaurant_id,action,created_at FROM vote_events WHERE id<$1 ORDER BY id DESC LIMIT 31',[before])).rows.map(e=>({...e,id:Number(e.id),created_at:Number(e.created_at)}));
-            if(mine)mine.updated_at=Number(mine.updated_at);
             await db.query('COMMIT');const events=rows.slice(0,30);const hasMore=rows.length>30;
-            return send(res,{counts,mine,events,hasMore,nextBefore:hasMore?events.at(-1).id:null,checkedAt:Date.now()},200,cookie);
+            return send(res,{mode:'multi',counts,participants,totalVotes:counts.reduce((s,c)=>s+c.count,0),mine,mySelections,events,hasMore,nextBefore:hasMore?events.at(-1).id:null,checkedAt:Date.now()},200,cookie);
           }
           await db.query('BEGIN');
           // Serialize one browser's changes across service instances and overlapping requests.
           await db.query('SELECT pg_advisory_xact_lock($1)',[BigInt('0x'+user.hash.slice(0,15)).toString()]);
-          const prior=(await db.query('SELECT voter_hash FROM vote_events WHERE request_id=$1',[input.requestId])).rows[0];
-          if(prior){if(prior.voter_hash!==user.hash)throw new HttpError(409,'请重新提交。');await db.query('COMMIT');return send(res,{ok:true},200,cookie);}
+          const prior=(await db.query('SELECT voter_hash,restaurant_id,action FROM vote_events WHERE request_id=$1',[input.requestId])).rows[0];
+          if(prior){if(prior.voter_hash!==user.hash||prior.restaurant_id!==input.restaurantId||(prior.action==='withdraw')!==(input.action==='remove'))throw new HttpError(409,'请重新提交。');await db.query('COMMIT');return send(res,{ok:true},200,cookie);}
+          const mine=(await db.query('SELECT nickname FROM vote_choices WHERE voter_hash=$1 AND restaurant_id=$2',[user.hash,input.restaurantId])).rows[0];
+          if((input.action==='remove'&&!mine)||(input.action==='add'&&mine?.nickname===input.nickname)){await db.query('COMMIT');return send(res,{ok:true,unchanged:true},200,cookie);}
           const recent=(await db.query('SELECT COUNT(*)::int AS count FROM vote_events WHERE voter_hash=$1 AND created_at>$2',[user.hash,Date.now()-60000])).rows[0];
-          if(recent.count>=6)throw new HttpError(429,'刚才改票有点频繁，等一分钟再试吧。');
-          const mine=(await db.query('SELECT nickname,restaurant_id FROM votes WHERE voter_hash=$1',[user.hash])).rows[0];
-          if(mine?.nickname===input.nickname&&mine.restaurant_id===input.restaurantId){await db.query('COMMIT');return send(res,{ok:true,unchanged:true},200,cookie);}
+          if(recent.count>=120)throw new HttpError(429,'刚才操作有点频繁，等一分钟再试吧。');
           const now=Date.now();
-          await db.query('INSERT INTO vote_events(request_id,voter_hash,nickname,restaurant_id,action,created_at) VALUES($1,$2,$3,$4,$5,$6)',[input.requestId,user.hash,input.nickname,input.restaurantId,mine?'change':'vote',now]);
-          await db.query('INSERT INTO votes(voter_hash,nickname,restaurant_id,created_at,updated_at) VALUES($1,$2,$3,$4,$4) ON CONFLICT(voter_hash) DO UPDATE SET nickname=excluded.nickname,restaurant_id=excluded.restaurant_id,updated_at=excluded.updated_at',[user.hash,input.nickname,input.restaurantId,now]);
+          const action=input.action==='remove'?'withdraw':mine?'rename':'vote';
+          await db.query('INSERT INTO vote_events(request_id,voter_hash,nickname,restaurant_id,action,created_at) VALUES($1,$2,$3,$4,$5,$6)',[input.requestId,user.hash,input.nickname,input.restaurantId,action,now]);
+          await db.query('UPDATE vote_choices SET nickname=$1 WHERE voter_hash=$2',[input.nickname,user.hash]);
+          if(input.action==='remove')await db.query('DELETE FROM vote_choices WHERE voter_hash=$1 AND restaurant_id=$2',[user.hash,input.restaurantId]);
+          else await db.query('INSERT INTO vote_choices(voter_hash,nickname,restaurant_id,created_at,updated_at) VALUES($1,$2,$3,$4,$4) ON CONFLICT(voter_hash,restaurant_id) DO UPDATE SET nickname=excluded.nickname,updated_at=excluded.updated_at',[user.hash,input.nickname,input.restaurantId,now]);
           await db.query('COMMIT');return send(res,{ok:true},200,cookie);
         }catch(error){try{await db.query('ROLLBACK');}catch{}if(error.code==='23505')throw new HttpError(409,'提交正在处理，请刷新查看记录。');throw error;}finally{db.release();}
       }
